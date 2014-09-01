@@ -1,178 +1,124 @@
 #![allow(visible_private_types)]
+#![feature(unboxed_closures)]
 #![feature(unsafe_destructor)]
 
-extern crate http = "tiny-http";
+extern crate tiny_http;
 
+use std::ops::Fn;
 use std::sync::Arc;
 use std::sync::atomics::AtomicOption;
 
-pub trait Request {
+pub mod route;
 
-}
-
-pub trait Response {
-    fn set_body<R: Reader + 'static>(&mut self, reader: R);
-}
-
-pub trait Middleware<InRq: Request, InRp: Response, OutRq: Request, OutRp: Response> {
+/// TODO: use associated types
+pub trait Middleware<InRq, InRp, OutRq, OutRp> {
     fn apply(&self, request: InRq, response: InRp) -> (OutRq, OutRp);
 }
 
-impl<InRq: Request, InRp: Response, OutRq: Request, OutRp: Response>
-    Middleware<InRq, InRp, OutRq, OutRp> for fn(InRq, InRp) -> (OutRq, OutRp)
-{
+pub struct FnToMiddleware<F>(F);
+
+pub fn to_middleware<F>(f: F) -> FnToMiddleware<F> {
+    FnToMiddleware(f)
+}
+
+impl<InRq, InRp, OutRq, OutRp, F: Fn<(InRq, InRp), (OutRq, OutRp)>> Middleware<InRq, InRp, OutRq, OutRp> for FnToMiddleware<F> {
     fn apply(&self, request: InRq, response: InRp) -> (OutRq, OutRp) {
-        (*self)(request, response)
+        let &FnToMiddleware(ref me) = self;
+        me.call((request, response))
     }
 }
 
-pub trait Handler<InRq: Request, InRp: Response> {
-    fn handle(&self, request: InRq, response: InRp);
-}
-
-impl<Rq: Request, Rp: Response> Handler<Rq, Rp> for fn(Rq, Rp) {
-    fn handle(&self, request: Rq, response: Rp) {
-        (*self)(request, response)
-    }
-}
-
-pub struct Server<Rq, Rp, M> {
-    middleware: M,
-    routes: Vec<Box<Handler<Rq, Rp> + Send + Share>>,
-}
-
-struct EmptyMiddlewareStack;
-
-impl<Rq: Request, Rp: Response> Middleware<Rq, Rp, Rq, Rp> for EmptyMiddlewareStack {
-    fn apply(&self, request: Rq, response: Rp) -> (Rq, Rp) {
-        (request, response)
-    }
-}
-
-struct MiddlewareStack<M, N> {
-    current: M,
-    next: N,
-}
-
-impl<InRq: Request, InRp: Response, MidRq: Request, MidRp: Response, OutRq: Request, OutRp: Response,
-    Curr: Middleware<InRq, InRp, MidRq, MidRp>, Next: Middleware<MidRq, MidRp, OutRq, OutRp>>
-    Middleware<InRq, InRp, OutRq, OutRp> for MiddlewareStack<Curr, Next>
-{
-    fn apply(&self, request: InRq, response: InRp) -> (OutRq, OutRp) {
-        let (r, p) = self.current.apply(request, response);
-        self.next.apply(r, p)
-    }
+pub struct Server<'a, Rq, Rp> {
+    middleware: Box<Fn<(BaseRequest, BaseResponse), (Rq, Rp)> + 'a>,
 }
 
 pub struct BaseRequest {
-    request: Arc<AtomicOption<http::Request>>,
-}
-
-impl Request for BaseRequest {
+    request: Arc<AtomicOption<tiny_http::Request>>,
 }
 
 pub struct BaseResponse {
-    response: Option<http::Response<Box<Reader>>>,
-    request: Arc<AtomicOption<http::Request>>,
+    //response: Option<tiny_http::Response<Box<Reader + Send>>>,
+    request: Arc<AtomicOption<tiny_http::Request>>,
 }
 
-impl Response for BaseResponse {
-    fn set_body<R: Reader + 'static>(&mut self, reader: R) {
-        use std::mem;
+impl BaseResponse {
+    fn set_body<R: Reader + Send>(&mut self, reader: R) {
+        /*use std::mem;
 
         let prev = mem::replace(&mut self.response, None).unwrap();
-        let prev = prev.with_data(box reader as Box<Reader>, None);
-        self.response = Some(prev);
+        let prev = prev.with_data(box reader as Box<Reader + Send>, None);
+        self.response = Some(prev);*/
     }
 }
 
 #[unsafe_destructor]
 impl Drop for BaseResponse {
     fn drop(&mut self) {
-        use std::sync::atomics::Relaxed;
+        /*use std::sync::atomics::Relaxed;
         let request = self.request.take(Relaxed).unwrap();
-        request.respond(self.response.take().unwrap());
+        request.respond(self.response.take().unwrap());*/
     }
 }
 
-impl Server<BaseRequest, BaseResponse, EmptyMiddlewareStack> {
-    pub fn new() -> Server<BaseRequest, BaseResponse, EmptyMiddlewareStack> {
+impl Server<'static, BaseRequest, BaseResponse> {
+    pub fn new() -> Server<'static, BaseRequest, BaseResponse> {
+        let middleware = |&: rq, rp| (rq, rp);
+        let middleware: Box<Fn<(BaseRequest, BaseResponse), (BaseRequest, BaseResponse)> + 'static> = box middleware;
+
         Server {
-            middleware: EmptyMiddlewareStack,
-            routes: Vec::new(),
+            middleware: middleware,
         }
     }
 }
 
-impl<Rq: Request, Rp: Response, M> Server<Rq, Rp, M> {
-    pub fn get(&mut self, _url: &str, handler: fn(Rq, Rp)) {
-        self.routes.push(box handler);
-    }
-}
-
-impl<OutRq: Request, OutRp: Response,
-    CurrM: Middleware<BaseRequest, BaseResponse, OutRq, OutRp> + Send + Share>
-    Server<OutRq, OutRp, CurrM>
-{
-    pub fn with_middleware<NOutRq: Request, NOutRp: Response,
-        M: Middleware<OutRq, OutRp, NOutRq, NOutRp>>(self, middleware: M) -> Server<NOutRq, NOutRp, MiddlewareStack<M, CurrM>>
+impl<'a, Rq, Rp> Server<'a, Rq, Rp> {
+    pub fn with<'b: 'a, OutRq, OutRp, M: Middleware<Rq, Rp, OutRq, OutRp> + 'b>(self, middleware: M)
+        -> Server<'b, OutRq, OutRp>
     {
-        // cannot add a new middleware if some routes have already been added
-        assert!(self.routes.len() == 0);
+        let current = self.middleware;
+
+        let middleware = |&: rq, rp| {
+            let (rq, rp) = current.call((rq, rp));
+            middleware.apply(rq, rp)
+        };
+
+        let middleware: Box<Fn<(BaseRequest, BaseResponse), (OutRq, OutRp)> + 'b> = box middleware;
 
         Server {
-            middleware: MiddlewareStack {
-                current: middleware,
-                next: self.middleware,
-            },
-            routes: Vec::new(),
+            middleware: middleware,
         }
     }
+}
 
-    pub fn with_middleware_fn<NOutRq: Request, NOutRp: Response>(self,
-        middleware: fn(OutRq, OutRp) -> (NOutRq, NOutRp)) -> Server<NOutRq, NOutRp, MiddlewareStack<fn(OutRq, OutRp) -> (NOutRq, NOutRp), CurrM>>
-    {
-        // cannot add a new middleware if some routes have already been added
-        assert!(self.routes.len() == 0);
-
-        Server {
-            middleware: MiddlewareStack {
-                current: middleware,
-                next: self.middleware,
-            },
-            routes: Vec::new(),
-        }
-    }
-
+impl<'a> Server<'a, (), ()> {
     pub fn listen(self) {
-        let server = http::Server::new_with_port(1025).unwrap();
+        let server = tiny_http::ServerBuilder::new().with_port(1025).build().unwrap();
         let server = Arc::new(server);
 
-        let middleware = Arc::new(self.middleware);
-        let routes = Arc::new(self.routes);
+        /*let middleware = Arc::new(self.middleware);
 
         for _ in range(0u, 4) {
             let server = server.clone();
             let middleware = middleware.clone();
             let routes = routes.clone();
 
-            spawn(proc() {
+            spawn(proc() {*/
                 loop {
                     use std::io::util::NullReader;
 
                     let request = server.recv().unwrap();
                     let request = Arc::new(AtomicOption::new(box request));
 
-                    let response = BaseResponse { request: request.clone(), response: Some(http::Response::new(http::StatusCode(200), Vec::new(), box NullReader as Box<Reader>, None, None)) };
+                    let response = BaseResponse { request: request.clone()/*, response: Some(tiny_http::Response::new(tiny_http::StatusCode(200), Vec::new(), box NullReader as Box<Reader>, None, None))*/ };
                     let request = BaseRequest { request: request };
 
-                    let (request, response) = middleware.apply(request, response);
+                    self.middleware.call((request, response));
 
                     // TODO:
-                    let routes = routes.deref();
-                    routes[0].handle(request, response);
+                    //let routes = routes.deref();
+                    //routes[0].handle(request, response);
                 }
-            })
-        }
+            //})
+        //}
     }
 }
